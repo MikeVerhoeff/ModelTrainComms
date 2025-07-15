@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "lib/interfaces",
+    "lib/logic",
+    "bin/embedded",
+    "bin/pc"
+]
+resolver = "3"
+
+[workspace.dependencies]
+interfaces = { path = "lib/interfaces" }
+logic = { path = "lib/logic" }
