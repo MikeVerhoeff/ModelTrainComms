@@ -1,9 +1,16 @@
 [target.thumbv7em-none-eabihf]
 rustflags = [
   "-C", "target-cpu=cortex-m4",
+  "-Clinker=rust-lld",
+  "-Clink-arg=-Tlink.x",
 ]
 
 [target.thumbv7em-none-eabi]
 rustflags = [
   "-C", "target-cpu=cortex-m4",
+  "-Clinker=rust-lld",
+  "-Clink-arg=-Tlink.x",
 ]
+
+[env]
+DEFMT_LOG = "trace"

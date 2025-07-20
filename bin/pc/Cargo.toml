@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+egui = "0.32.0"
+iced = "0.13.1"
 interfaces.workspace = true
 logic.workspace = true
