@@ -1,3 +1,5 @@
+cargo-features = ["per-package-target"]
+
 [workspace]
 members = [
     "lib/interfaces",
