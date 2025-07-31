@@ -178,7 +178,7 @@ async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, 
         info!("data: {:x}", data);
         pin.toggle();
         class.write_packet(before).await?;
-        class.write_packet(&buf).await?;
+        class.write_packet(data).await?;
         class.write_packet(after).await?;
         buf.fill(0u8);
     }
