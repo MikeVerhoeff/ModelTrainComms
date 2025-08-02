@@ -35,3 +35,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[test]
+fn serialization_test() {
+    let serialize_results = interfaces::serialize_test();
+    println!("Serialize result: {:?}", serialize_results);
+    if let Ok(bytes) = serialize_results {
+        let deserialize_result = interfaces::deserialize_test(&bytes);
+        println!("Deserialize result: {:?}", deserialize_result);
+    }
+}

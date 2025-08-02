@@ -29,7 +29,7 @@ embassy-usb-logger = { version = "0.4.0" }
 log = { version = "0.4.27" }
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 futures-util = { version = "0.3.30", default-features = false }
-heapless = { version = "0.8", default-features = false }
+heapless = { version = "0.7.17", default-features = false }
 critical-section = "1.1"
 nb = "1.0.0"
 embedded-storage = "0.3.1"
