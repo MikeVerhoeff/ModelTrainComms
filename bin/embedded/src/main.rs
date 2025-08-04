@@ -1,15 +1,19 @@
 #![no_std]
 #![no_main]
 
+use cortex_m::singleton;
 use defmt::{panic, *};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
+use embassy_stm32::adc::{Adc, RingBufferedAdc, SampleTime, Sequence};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode;
+use embassy_stm32::peripherals::*;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usb::{Driver, Instance};
 use embassy_stm32::{bind_interrupts, peripherals, usb, Config};
+use embassy_time::Instant;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
@@ -29,8 +33,10 @@ bind_interrupts!(struct Irqs {
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
 });
 
+static mut ADC_SAMPLE_STORE: &'static mut [u16; 512] = &mut [0; 512];
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
@@ -54,7 +60,7 @@ async fn main(_spawner: Spawner) {
     }
     let p = embassy_stm32::init(config);
     //let p = embassy_stm32::init(Default::default());
-    
+
     let mut spi_config  = spi::Config::default();
     spi_config.frequency = Hertz(1_000_000);
 
@@ -103,6 +109,9 @@ async fn main(_spawner: Spawner) {
     pin13.set_low();
     pin14.set_low();
     pin15.set_low();
+
+
+    spawner.spawn(adc_task(p.ADC1, p.PA2, p.DMA2_CH0)).unwrap();
 
     onboard_led.set_high();
 
@@ -182,19 +191,71 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, pin: &mut Output<'_>, spi: &mut Spi<'_, mode::Async>) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
-    let before = b"recived: '";
-    let after = b"'\r\n";
+async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, pin: &mut Output<'_>, _spi: &mut Spi<'_, mode::Async>) -> Result<(), Disconnected> {
+    //let mut buf = [0; 64];
+    //let before = b"recived: '";
+    //let after = b"'\r\n";
     loop {
-        let n = class.read_packet(&mut buf).await?;
-        let data = &mut buf[..n];
-        info!("data: {:x}", data);
+        //let n = class.read_packet(&mut buf).await?;
+        //let data = &mut buf[..n];
+        //info!("data: {:x}", data);
         pin.toggle();
-        class.write_packet(before).await?;
-        class.write_packet(data).await?;
-        class.write_packet(after).await?;
-        unwrap!(spi.write(data).await);
-        buf.fill(0u8);
+        //class.write_packet(before).await?;
+        //class.write_packet(data).await?;
+        //class.write_packet(after).await?;
+        //unwrap!(spi.write(data).await);
+        //buf.fill(0u8);
+        
+        for i in 0..512 {
+            let lower = unsafe { (ADC_SAMPLE_STORE[i]&0b0000000011111111) as u8 };
+            let upper = unsafe { ((ADC_SAMPLE_STORE[i]&0b1111111100000000)>>8) as u8 };
+            class.write_packet(&[lower, upper]).await?;
+        }
+
+        //class.write_packet(unsafe { core::mem::transmute::<&[u16; 512], &[u8; 1024]>(ADC_SAMPLE_STORE) }).await?;
+    }
+}
+
+#[embassy_executor::task]
+async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
+    const ADC_BUF_SIZE: usize = 1024;
+    let adc_data: &mut [u16; ADC_BUF_SIZE] = singleton!(ADCDAT : [u16; ADC_BUF_SIZE] = [0u16; ADC_BUF_SIZE]).unwrap();
+
+    let adc = Adc::new(adc1);
+
+    let mut adc: RingBufferedAdc<embassy_stm32::peripherals::ADC1> = adc.into_ring_buffered(dma_ch, adc_data);
+
+    adc.set_sample_sequence(Sequence::One, &mut pa2, SampleTime::CYCLES112);
+
+    // Note that overrun is a big consideration in this implementation. Whatever task is running the adc.read() calls absolutely must circle back around
+    // to the adc.read() call before the DMA buffer is wrapped around > 1 time. At this point, the overrun is so significant that the context of
+    // what channel is at what index is lost. The buffer must be cleared and reset. This *is* handled here, but allowing this to happen will cause
+    // a reduction of performance as each time the buffer is reset, the adc & dma buffer must be restarted.
+
+    // An interrupt executor with a higher priority than other tasks may be a good approach here, allowing this task to wake and read the buffer most
+    // frequently.
+    let mut tic = Instant::now();
+    //let mut buffer1 = [0u16; 512]; -> ADC_SAMPLE_STORE
+    let _ = adc.start();
+    loop {
+        unsafe {
+            match adc.read(ADC_SAMPLE_STORE).await {
+                Ok(_data) => {
+                    let toc = Instant::now();
+                    info!(
+                        "\n adc1: {} dt = {}, n = {}",
+                        ADC_SAMPLE_STORE[0..16],
+                        (toc - tic).as_micros(),
+                        _data
+                    );
+                    tic = toc;
+                }
+                Err(e) => {
+                    warn!("Error: {:?}", e);
+                    //ADC_SAMPLE_STORE = [0u16; 512];
+                    let _ = adc.start();
+                }
+            }
+        }
     }
 }
