@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod new_main;
 mod uart_comm_handler;
 
 use cortex_m::singleton;
@@ -29,9 +30,6 @@ use {defmt_rtt as _, panic_probe as _};
 fn panic() -> ! {
     core::panic!("panic via `defmt::panic!`")
 }
-
-static TO_MAIN_LOOP: Channel<CriticalSectionRawMutex, CommObject, 2> = Channel::new();
-static TO_UART: Channel<CriticalSectionRawMutex, CommObject, 2> = Channel::new();
 
 //#[embassy_executor::task]
 //async fn logger_task(driver: Driver<'static, peripherals::USB_OTG_FS>) {
