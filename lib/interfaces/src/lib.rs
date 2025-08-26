@@ -1,8 +1,9 @@
 #![no_std]
 
 mod comm_object;
+pub mod encoding;
 
-use heapless::{String};
+use heapless::String;
 
 pub use crate::comm_object::*;
 

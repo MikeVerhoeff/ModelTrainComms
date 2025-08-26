@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod uart_comm_handler;
+
 use cortex_m::singleton;
 use defmt::{panic, *};
 use embassy_executor::Spawner;
@@ -12,17 +14,24 @@ use embassy_stm32::peripherals::*;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usb::{Driver, Instance};
-use embassy_stm32::{bind_interrupts, peripherals, usb, Config};
+use embassy_stm32::{Config, bind_interrupts, peripherals, usb};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::channel::Channel;
 use embassy_time::Instant;
+use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
-use embassy_usb::Builder;
+use futures_util::StreamExt;
+use interfaces::CommObject;
 use {defmt_rtt as _, panic_probe as _};
 
 #[defmt::panic_handler]
 fn panic() -> ! {
     core::panic!("panic via `defmt::panic!`")
 }
+
+static TO_MAIN_LOOP: Channel<CriticalSectionRawMutex, CommObject, 2> = Channel::new();
+static TO_UART: Channel<CriticalSectionRawMutex, CommObject, 2> = Channel::new();
 
 //#[embassy_executor::task]
 //async fn logger_task(driver: Driver<'static, peripherals::USB_OTG_FS>) {
@@ -61,20 +70,19 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
     //let p = embassy_stm32::init(Default::default());
 
-    let mut spi_config  = spi::Config::default();
+    let mut spi_config = spi::Config::default();
     spi_config.frequency = Hertz(1_000_000);
 
     let mut spi = Spi::new_txonly(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3, spi_config);
 
-
     //loop {
-        let mut buf = [0x0Au8; 4];
-        unwrap!(spi.blocking_transfer_in_place(&mut buf));
-        info!("xfer {=[u8]:x}", buf);
+    let mut buf = [0x0Au8; 4];
+    unwrap!(spi.blocking_transfer_in_place(&mut buf));
+    info!("xfer {=[u8]:x}", buf);
     //}
 
     let mut onboard_led = Output::new(p.PC13, Level::High, Speed::Low);
-    
+
     let mut pin0 = Output::new(p.PB9, Level::High, Speed::Low);
     let mut pin1 = Output::new(p.PB8, Level::High, Speed::Low);
     let mut pin2 = Output::new(p.PB7, Level::High, Speed::Low);
@@ -110,6 +118,8 @@ async fn main(spawner: Spawner) {
     pin14.set_low();
     pin15.set_low();
 
+    //let uart_comm_channel = Channel::new();
+    let mut uart_comm_channel = Channel::<NoopRawMutex, interfaces::CommObject, 3>::new();
 
     spawner.spawn(adc_task(p.ADC1, p.PA2, p.DMA2_CH0)).unwrap();
 
@@ -125,7 +135,14 @@ async fn main(spawner: Spawner) {
     // has to support it or USB won't work at all. See docs on `vbus_detection` for details.
     config.vbus_detection = false;
 
-    let driver = Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, &mut ep_out_buffer, config);
+    let driver = Driver::new_fs(
+        p.USB_OTG_FS,
+        Irqs,
+        p.PA12,
+        p.PA11,
+        &mut ep_out_buffer,
+        config,
+    );
 
     // Create embassy-usb Config
     let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
@@ -153,6 +170,8 @@ async fn main(spawner: Spawner) {
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
 
+    let (usb_tx, usb_rx) = class.split();
+
     // Build the builder.
     let mut usb = builder.build();
 
@@ -178,8 +197,6 @@ async fn main(spawner: Spawner) {
     join(usb_fut, echo_fut).await;
 }
 
-
-
 struct Disconnected {}
 
 impl From<EndpointError> for Disconnected {
@@ -191,7 +208,11 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, pin: &mut Output<'_>, _spi: &mut Spi<'_, mode::Async>) -> Result<(), Disconnected> {
+async fn echo<'d, T: Instance + 'd>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+    pin: &mut Output<'_>,
+    _spi: &mut Spi<'_, mode::Async>,
+) -> Result<(), Disconnected> {
     //let mut buf = [0; 64];
     //let before = b"recived: '";
     //let after = b"'\r\n";
@@ -205,10 +226,10 @@ async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, 
         //class.write_packet(after).await?;
         //unwrap!(spi.write(data).await);
         //buf.fill(0u8);
-        
+
         for i in 0..512 {
-            let lower = unsafe { (ADC_SAMPLE_STORE[i]&0b0000000011111111) as u8 };
-            let upper = unsafe { ((ADC_SAMPLE_STORE[i]&0b1111111100000000)>>8) as u8 };
+            let lower = unsafe { (ADC_SAMPLE_STORE[i] & 0b0000000011111111) as u8 };
+            let upper = unsafe { ((ADC_SAMPLE_STORE[i] & 0b1111111100000000) >> 8) as u8 };
             class.write_packet(&[lower, upper]).await?;
         }
 
@@ -219,11 +240,13 @@ async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>, 
 #[embassy_executor::task]
 async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
     const ADC_BUF_SIZE: usize = 1024;
-    let adc_data: &mut [u16; ADC_BUF_SIZE] = singleton!(ADCDAT : [u16; ADC_BUF_SIZE] = [0u16; ADC_BUF_SIZE]).unwrap();
+    let adc_data: &mut [u16; ADC_BUF_SIZE] =
+        singleton!(ADCDAT : [u16; ADC_BUF_SIZE] = [0u16; ADC_BUF_SIZE]).unwrap();
 
     let adc = Adc::new(adc1);
 
-    let mut adc: RingBufferedAdc<embassy_stm32::peripherals::ADC1> = adc.into_ring_buffered(dma_ch, adc_data);
+    let mut adc: RingBufferedAdc<embassy_stm32::peripherals::ADC1> =
+        adc.into_ring_buffered(dma_ch, adc_data);
 
     adc.set_sample_sequence(Sequence::One, &mut pa2, SampleTime::CYCLES112);
 
