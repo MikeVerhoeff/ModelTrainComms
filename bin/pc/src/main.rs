@@ -8,10 +8,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let ports = SerialPort::available_ports()?;
 
-    if ports.len()==0 {
+    if ports.len() == 0 {
         panic!("No serial ports")
     }
-    if ports.len()>1 {
+    if ports.len() > 1 {
         println!("Serial Ports: {ports:?}");
         panic!("Can't not pick serial port");
     }
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut count = 0;
 
-    while count<17 {
+    while count < 17 {
         let mut buffer = [0u8; 256];
         let bytes = port.read(&mut buffer).await?;
         //print!("[{bytes}:{:?}]", &buffer[0..bytes]);

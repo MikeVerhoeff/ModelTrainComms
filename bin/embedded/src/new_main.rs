@@ -2,38 +2,34 @@
 #![no_main]
 
 use cortex_m::singleton;
-use defmt::{panic, *};
 use embassy_executor::Spawner;
-use embassy_futures::join::{join, join3, join4, join5};
-use embassy_futures::yield_now;
-use embassy_stm32::adc::{Adc, RingBufferedAdc, SampleTime, Sequence};
-use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::peripherals::{ADC1, DMA2_CH0, DMA2_CH3, PA2, PB3, PB5, SPI1, USB_OTG_FS};
-use embassy_stm32::spi::Spi;
-use embassy_stm32::time::Hertz;
-use embassy_stm32::usb::{Driver, Instance};
-use embassy_stm32::{Config, bind_interrupts, peripherals, usb};
-use embassy_stm32::{Peripherals, spi};
+use embassy_stm32::{
+    Config, Peripherals,
+    adc::{Adc, RingBufferedAdc, SampleTime, Sequence},
+    bind_interrupts,
+    gpio::{Level, Output, Speed},
+    peripherals::{self, ADC1, DMA2_CH0, DMA2_CH3, PA2, PB3, PB5, SPI1, USB_OTG_FS},
+    spi::{self, Spi},
+    time::Hertz,
+    usb::{self, Driver},
+};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_usb::Builder;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
-use embassy_usb::driver::EndpointError;
+use embassy_usb::{
+    Builder,
+    class::cdc_acm::{CdcAcmClass, Receiver, Sender, State},
+};
 use interfaces::{CommBytes, CommObject, MAX_PACKET_SIZE, encoding};
 use {defmt_rtt as _, panic_probe as _};
+
+static TO_MAIN_LOOP: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
+static TO_UART: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
+static TO_RAIL: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
 
 #[defmt::panic_handler]
 fn panic() -> ! {
     core::panic!("panic via `defmt::panic!`")
 }
-
-bind_interrupts!(struct Irqs {
-    OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
-});
-
-static TO_MAIN_LOOP: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
-static TO_UART: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
-static TO_RAIL: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
 
 fn get_peripherals() -> Peripherals {
     let mut config = Config::default();
@@ -60,24 +56,26 @@ fn get_peripherals() -> Peripherals {
     embassy_stm32::init(config)
 }
 
-#[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    let p = get_peripherals();
+bind_interrupts!(struct Irqs {
+    OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
+});
 
-    let mut onboard_led = Output::new(p.PC13, Level::High, Speed::Low);
+//#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    // init
+    let p = get_peripherals();
 
     let mut pin0 = Output::new(p.PB9, Level::High, Speed::Low);
     let mut pin1 = Output::new(p.PB8, Level::High, Speed::Low);
     let mut pin2 = Output::new(p.PB7, Level::High, Speed::Low);
     let mut pin3 = Output::new(p.PB6, Level::High, Speed::Low);
 
-    onboard_led.set_low();
     pin0.set_low();
     pin1.set_low();
     pin2.set_low();
     pin3.set_low();
 
-    onboard_led.set_high();
+    pin0.set_high();
 
     // Create the driver, from the HAL.
     let mut ep_out_buffer = [0u8; 256];
@@ -122,32 +120,29 @@ async fn main(_spawner: Spawner) {
     );
 
     // Create classes on the builder.
-    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    let class = CdcAcmClass::new(&mut builder, &mut state, MAX_PACKET_SIZE as u16);
+
     let (usb_tx, usb_rx) = class.split();
 
     // Build the builder.
     let mut usb = builder.build();
 
-    // Run the USB device.
-    let usb_fut = usb.run();
+    usb.run().await;
+    pin1.set_high();
 
-    pin0.set_high();
-
-    join5(
-        usb_fut,
-        main_loop(),
-        adc_task(p.ADC1, p.PA2, p.DMA2_CH0),
-        from_uart(usb_rx),
-        to_rail(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3),
-        //to_uart(usb_tx),
+    /*embassy_futures::join::join(
+        usb.run(),
+        embassy_futures::join::join5(
+            adc_task(p.ADC1, p.PA2, p.DMA2_CH0),
+            from_uart(usb_rx),
+            to_rail(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3),
+            to_uart(usb_tx),
+            main_loop(),
+        ),
     )
-    .await;
-
-    // Run everything concurrently.
-    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    //join(usb_fut, echo_fut).await;
+    .await;*/
 }
-
+/*
 async fn main_loop() {
     loop {
         let command_bytes = TO_MAIN_LOOP.receive().await;
@@ -207,22 +202,20 @@ async fn from_uart<'a>(mut receiver: Receiver<'a, Driver<'a, USB_OTG_FS>>) {
     let mut data = [0u8; MAX_PACKET_SIZE];
     let mut decoder = encoding::Encoder::new();
     loop {
-        yield_now().await;
         if let Ok(mut size) = receiver.read_packet(&mut data).await {
-            //loop {
-            /*yield_now().await;
-            let (consumed, success) = decoder.encoded_input(&data, size);
-            if success {
-                let mut buffer: CommBytes = [0u8; MAX_PACKET_SIZE];
-                let message_bytes = decoder.decode();
-                buffer.clone_from_slice(message_bytes);
-                TO_MAIN_LOOP.send(buffer).await;
+            loop {
+                let (consumed, success) = decoder.encoded_input(&data, size);
+                if success {
+                    let mut buffer: CommBytes = [0u8; MAX_PACKET_SIZE];
+                    let message_bytes = decoder.decode();
+                    buffer.clone_from_slice(message_bytes);
+                    TO_MAIN_LOOP.send(buffer).await;
+                }
+                size -= consumed;
+                if consumed == 0 {
+                    break;
+                }
             }
-            size -= consumed;
-            if consumed == 0 {
-                break;
-            }*/
-            //}
         }
 
         // parse_data
@@ -232,6 +225,7 @@ async fn from_uart<'a>(mut receiver: Receiver<'a, Driver<'a, USB_OTG_FS>>) {
 }
 
 async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
+    loop {}
     // read from TO_RAIL and write to spi/rails
 
     let mut spi_config = spi::Config::default();
@@ -240,9 +234,8 @@ async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
     let mut spi = Spi::new_txonly(peri, sck, mosi, tx_dma, spi_config);
 
     loop {
-        yield_now().await;
-        //let to_send = TO_RAIL.receive().await;
-        let to_send = [56u8, 178u8, 200u8, 63u8];
+        let to_send = TO_RAIL.receive().await;
+
         let _ = spi.write(&to_send).await;
     }
 }
@@ -259,25 +252,4 @@ async fn to_uart<'a>(mut sender: Sender<'a, Driver<'a, USB_OTG_FS>>) {
         let _ = sender.write_packet(&message).await;
     }
 }
-
-struct Disconnected {}
-
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
-            EndpointError::Disabled => Disconnected {},
-        }
-    }
-}
-
-async fn echo<'d, T: Instance + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
-    pin: &mut Output<'_>,
-) -> Result<(), Disconnected> {
-    loop {
-        pin.toggle();
-
-        class.write_packet("test\n".as_bytes()).await?;
-    }
-}
+*/

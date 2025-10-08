@@ -12,6 +12,12 @@ pub struct Encoder {
     input_pos: usize,
 }
 
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Encoder {
     pub fn new() -> Self {
         Encoder {
@@ -35,23 +41,23 @@ impl Encoder {
             PREAMBLE_SIZE + DATA_SIZE,
         );
         self.encode_buffer();
-        return &self.buffer;
+        &self.buffer
     }
 
     fn encode_buffer(&mut self) {
         for i in PREAMBLE_SIZE..PREAMBLE_SIZE + DATA_SIZE {
-            self.buffer[i] = self.buffer[i] & 0b01010101u8;
+            self.buffer[i] &= 0b01010101u8;
             self.buffer[i] |= (!(self.buffer[i] << 1)) & 0b10101010u8;
         }
         for i in PREAMBLE_SIZE + DATA_SIZE..PREAMBLE_SIZE + 2 * DATA_SIZE {
-            self.buffer[i] = self.buffer[i] & 0b10101010u8;
+            self.buffer[i] &= 0b10101010u8;
             self.buffer[i] |= (!(self.buffer[i] >> 1)) & 0b01010101u8;
         }
     }
 
     pub fn decode(&mut self) -> &[u8] {
         for i in PREAMBLE_SIZE..PREAMBLE_SIZE + DATA_SIZE {
-            self.buffer[i] = self.buffer[i] & 0b01010101u8;
+            self.buffer[i] &= 0b01010101u8;
         }
         for i in PREAMBLE_SIZE + DATA_SIZE..PREAMBLE_SIZE + 2 * DATA_SIZE {
             self.buffer[i - DATA_SIZE] |= self.buffer[i] & 0b10101010u8;
@@ -61,16 +67,14 @@ impl Encoder {
 
     pub fn encoded_input(&mut self, input: &[u8], bytes: usize) -> (usize, bool) {
         let mut n = 0;
-        for i in 0..(min(input.len(), bytes)) {
+        for input in input.iter().take(min(input.len(), bytes)) {
             if self.input_pos >= PREAMBLE_SIZE {
-                self.buffer[self.input_pos] = input[i];
+                self.buffer[self.input_pos] = *input;
+                self.input_pos += 1;
+            } else if *input == PREAMBLE[self.input_pos] {
                 self.input_pos += 1;
             } else {
-                if input[i] == PREAMBLE[self.input_pos] {
-                    self.input_pos += 1;
-                } else {
-                    self.input_pos = 0;
-                }
+                self.input_pos = 0;
             }
             n += 1;
             if self.input_pos == self.buffer.len() {

@@ -1442,6 +1442,7 @@ dependencies = [
  "micromath",
  "nb 1.1.0",
  "panic-probe",
+ "postcard",
  "static_cell",
  "usbd-hid",
 ]
