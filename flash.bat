@@ -1,0 +1,1 @@
+cargo flash --chip STM32F401CD -p embedded --release

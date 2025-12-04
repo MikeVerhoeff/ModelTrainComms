@@ -1,10 +1,12 @@
 #![no_std]
 #![no_main]
 
+use core::cell::Cell;
+
+use cortex_m::interrupt::Mutex;
 use cortex_m::singleton;
-use defmt::{panic, *};
-use embassy_executor::Spawner;
-use embassy_futures::join::{join, join3, join4, join5};
+use defmt::panic;
+use embassy_executor::{Spawner, task};
 use embassy_futures::yield_now;
 use embassy_stm32::adc::{Adc, RingBufferedAdc, SampleTime, Sequence};
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -20,11 +22,35 @@ use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
 use interfaces::{CommBytes, CommObject, MAX_PACKET_SIZE, encoding};
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+static PANIC_LED: Mutex<Cell<Option<Output>>> = Mutex::new(Cell::new(None));
 
 #[defmt::panic_handler]
 fn panic() -> ! {
-    core::panic!("panic via `defmt::panic!`")
+    cortex_m::interrupt::free(|cs| {
+        // Try to retrieve the LED pin handle from the global resource.
+        if let Some(mut led) = PANIC_LED.borrow(cs).take() {
+            // --- LED ON LOGIC ---
+            led.set_high(); // Turn on the LED to signal panic.
+            for _ in 0..10_000 {
+                cortex_m::asm::nop();
+            }
+            led.set_low();
+            for _ in 0..10_000 {
+                cortex_m::asm::nop();
+            }
+            led.set_high();
+
+            // Put the pin back (politeness, not strictly required as we halt)
+            PANIC_LED.borrow(cs).set(Some(led));
+        }
+    });
+
+    loop {
+        cortex_m::asm::wfi();
+    }
 }
 
 bind_interrupts!(struct Irqs {
@@ -59,9 +85,24 @@ fn get_peripherals() -> Peripherals {
     }
     embassy_stm32::init(config)
 }
+static EP_OUT_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
+
+static STATE: StaticCell<State<'static>> = StaticCell::new();
+
+static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+
+async fn spi_message(text: &[u8]) {
+    let mut message = [b' '; 256];
+    //message[text.len()] = '\n';
+    //message[255] = '\n';
+    message.copy_from_slice(text);
+    TO_RAIL.send(message).await;
+}
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = get_peripherals();
 
     let mut onboard_led = Output::new(p.PC13, Level::High, Speed::Low);
@@ -79,8 +120,11 @@ async fn main(_spawner: Spawner) {
 
     onboard_led.set_high();
 
+    cortex_m::interrupt::free(|cs| {
+        PANIC_LED.borrow(cs).set(Some(pin1));
+    });
+
     // Create the driver, from the HAL.
-    let mut ep_out_buffer = [0u8; 256];
     let mut config = embassy_stm32::usb::Config::default();
 
     // Do not enable vbus_detection. This is a safe default that works in all boards.
@@ -89,79 +133,86 @@ async fn main(_spawner: Spawner) {
     // has to support it or USB won't work at all. See docs on `vbus_detection` for details.
     config.vbus_detection = false;
 
+    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
+    let bos_descriptor = BOS_DESCRIPTOR.init([0; 256]);
+    let control_buf = CONTROL_BUF.init([0; 64]);
+    let ep_out_buffer = EP_OUT_BUFFER.init([0; 256]);
+
+    let state = STATE.init(State::new()); // Note the 'static lifetime of the returned State<&'static CS>
+
+    let config = embassy_stm32::usb::Config::default();
+    #[allow(static_mut_refs)]
     let driver = Driver::new_fs(
         p.USB_OTG_FS,
         Irqs,
         p.PA12,
         p.PA11,
-        &mut ep_out_buffer,
+        ep_out_buffer, // This is okay because `ep_out_buffer` is local to main
         config,
     );
 
-    // Create embassy-usb Config
-    let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
-    config.manufacturer = Some("Embassy");
-    config.product = Some("USB-serial example");
-    config.serial_number = Some("12345678");
-
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 64];
-
-    let mut state = State::new();
+    let usb_config = embassy_usb::Config::new(0xc0de, 0xcafe);
 
     let mut builder = Builder::new(
         driver,
-        config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
-        &mut [], // no msos descriptors
-        &mut control_buf,
+        usb_config,
+        config_descriptor,
+        bos_descriptor,
+        &mut [],
+        control_buf,
     );
 
-    // Create classes on the builder.
-    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    let class = CdcAcmClass::new(&mut builder, state, 64);
     let (usb_tx, usb_rx) = class.split();
 
     // Build the builder.
     let mut usb = builder.build();
 
-    // Run the USB device.
-    let usb_fut = usb.run();
-
     pin0.set_high();
 
-    join5(
-        usb_fut,
-        main_loop(),
-        adc_task(p.ADC1, p.PA2, p.DMA2_CH0),
-        from_uart(usb_rx),
-        to_rail(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3),
-        //to_uart(usb_tx),
-    )
-    .await;
+    //let _ = spawner.spawn(adc_task(p.ADC1, p.PA2, p.DMA2_CH0));
+    let _ = spawner.spawn(to_rail(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3));
 
-    // Run everything concurrently.
-    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    //join(usb_fut, echo_fut).await;
+    let _ = spawner.spawn(to_uart(usb_tx));
+    //let _ = spawner.spawn(from_uart(usb_rx));
+
+    let _ = spawner.spawn(main_loop());
+
+    pin2.set_high();
+
+    usb.run().await;
 }
 
+#[task]
 async fn main_loop() {
+    //spi_message(b"Start main loop").await;
+
     loop {
-        let command_bytes = TO_MAIN_LOOP.receive().await;
-        let result: Result<CommObject, postcard::Error> = postcard::from_bytes(&command_bytes);
+        yield_now().await;
+        //let command_bytes = TO_MAIN_LOOP.receive().await;
+        let mut command_bytes = [0u8; 256];
+        command_bytes[0] = b'a';
+        command_bytes[1] = b'b';
+        command_bytes[2] = b'x';
+        command_bytes[3] = b'y';
+        //TO_RAIL.send(command_bytes).await;
+        TO_UART.send(command_bytes).await;
+
+        //spi_message(b"Main loop").await;
+
+        /*let result: Result<CommObject, postcard::Error> = postcard::from_bytes(&command_bytes);
         if let Ok(command) = result {
             match command {
                 CommObject::Text(_) => TO_RAIL.send(command_bytes).await,
                 CommObject::Err(_) => TO_UART.send(command_bytes).await,
             }
-        }
+        }*/
     }
 }
 
+#[task]
 async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
+    //spi_message(b"Start adc_task").await;
     // sample adc and send to TO_MAIN_LOOP
     let mut adc_sample_store = [0; 512];
 
@@ -202,12 +253,15 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
     }
 }
 
-async fn from_uart<'a>(mut receiver: Receiver<'a, Driver<'a, USB_OTG_FS>>) {
+#[task]
+async fn from_uart(mut receiver: Receiver<'static, Driver<'static, USB_OTG_FS>>) {
+    //spi_message(b"Start from_uart").await;
+
     // read from usb/uart and write to TO_MAIN_LOOP
     let mut data = [0u8; MAX_PACKET_SIZE];
-    let mut decoder = encoding::Encoder::new();
+    //let mut decoder = encoding::Encoder::new();
     loop {
-        yield_now().await;
+        //yield_now().await;
         if let Ok(mut size) = receiver.read_packet(&mut data).await {
             //loop {
             /*yield_now().await;
@@ -223,14 +277,17 @@ async fn from_uart<'a>(mut receiver: Receiver<'a, Driver<'a, USB_OTG_FS>>) {
                 break;
             }*/
             //}
+
+            //let _ = TO_MAIN_LOOP.send(data);
+        } else {
+            //spi_message(b"uart receiver error").await;
         }
 
         // parse_data
-
-        //TO_MAIN_LOOP.send(message)
     }
 }
 
+#[task]
 async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
     // read from TO_RAIL and write to spi/rails
 
@@ -239,45 +296,46 @@ async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
 
     let mut spi = Spi::new_txonly(peri, sck, mosi, tx_dma, spi_config);
 
+    spi.write(b"SPI Start\n").await;
+
     loop {
-        yield_now().await;
-        //let to_send = TO_RAIL.receive().await;
-        let to_send = [56u8, 178u8, 200u8, 63u8];
-        let _ = spi.write(&to_send).await;
+        let mut to_send = TO_RAIL.receive().await;
+        to_send[32] = b'\n';
+        //let to_send = [0x38u8, 0xB2u8, 0xC8u8, 0x3Fu8];
+        let _ = spi.write(&to_send[0..33]).await;
     }
 }
 
-async fn to_uart<'a>(mut sender: Sender<'a, Driver<'a, USB_OTG_FS>>) {
+#[task]
+async fn to_uart(mut sender: Sender<'static, Driver<'static, USB_OTG_FS>>) {
+    //spi_message(b"Start to_uart").await;
+
     // read from TO_UART and write to usb/uart
-    loop {}
     loop {
         let message = TO_UART.receive().await;
 
         // serialize(message, data)
 
-        //let _ = sender.write_packet("Test uart\n".as_bytes()).await;
-        let _ = sender.write_packet(&message).await;
-    }
-}
+        let mut debug_message = [b' '; 256];
+        debug_message[0..7].copy_from_slice(b"Message");
+        debug_message[8..12].copy_from_slice(&message[0..4]);
 
-struct Disconnected {}
+        //let _ = sender.write_packet("Test uart\n\r".as_bytes()).await;
+        let result = sender.write_packet(&message[0..4]).await;
 
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
-            EndpointError::Disabled => Disconnected {},
+        debug_message[12..18].copy_from_slice(b"Result");
+
+        if let Err(e) = result {
+            match e {
+                EndpointError::BufferOverflow => {
+                    debug_message[18..32].copy_from_slice(b"BufferOverflow")
+                }
+                EndpointError::Disabled => debug_message[18..26].copy_from_slice(b"Disabled"),
+            }
+        } else {
+            debug_message[18..20].copy_from_slice(b"Ok");
         }
-    }
-}
 
-async fn echo<'d, T: Instance + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
-    pin: &mut Output<'_>,
-) -> Result<(), Disconnected> {
-    loop {
-        pin.toggle();
-
-        class.write_packet("test\n".as_bytes()).await?;
+        TO_RAIL.send(debug_message).await;
     }
 }

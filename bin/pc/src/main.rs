@@ -18,15 +18,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let port = SerialPort::open(&ports[0], 9600)?;
 
-    let send_buf = b"test";
-    port.write(send_buf).await?;
+    //let send_buf = b"test";
+    let send_buf = [b'a'; 256];
+    port.write(&send_buf).await?;
 
     let mut count = 0;
 
     while count < 17 {
         let mut buffer = [0u8; 256];
         let bytes = port.read(&mut buffer).await?;
-        //print!("[{bytes}:{:?}]", &buffer[0..bytes]);
+        print!("[{bytes}:{:?}]", &buffer[0..bytes]);
         for c in &buffer[0..bytes] {
             print!("{}", *c as char);
         }
