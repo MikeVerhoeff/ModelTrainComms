@@ -10,14 +10,16 @@ use embassy_executor::{Spawner, task};
 use embassy_futures::yield_now;
 use embassy_stm32::adc::{Adc, RingBufferedAdc, SampleTime, Sequence};
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::peripherals::{ADC1, DMA2_CH0, DMA2_CH3, PA2, PB3, PB5, SPI1, USB_OTG_FS};
+use embassy_stm32::interrupt::InterruptExt;
+use embassy_stm32::peripherals::{ADC1, DMA2_CH0, DMA2_CH3, PA2, PB3, PB5, PB6, SPI1, USB_OTG_FS};
 use embassy_stm32::spi::Spi;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usb::{Driver, Instance};
-use embassy_stm32::{Config, bind_interrupts, peripherals, usb};
+use embassy_stm32::{Config, bind_interrupts, interrupt, peripherals, usb};
 use embassy_stm32::{Peripherals, spi};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Timer;
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
@@ -95,28 +97,49 @@ static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
 async fn spi_message(text: &[u8]) {
     let mut message = [b' '; 256];
-    //message[text.len()] = '\n';
-    //message[255] = '\n';
-    message.copy_from_slice(text);
+    message[..text.len()].copy_from_slice(text);
     TO_RAIL.send(message).await;
 }
+async fn usb_message(text: &[u8]) {
+    let mut message_buffer = [b' '; 256];
+
+    let message_object = CommObject::Text("USB_mesage_test\r\n");
+    match postcard::to_slice(&message_object, &mut message_buffer) {
+        Ok(_) => {
+            spi_message(b"Usb message Serialized").await;
+            TO_RAIL.send(message_buffer).await;
+        }
+        Err(_) => spi_message(b"Comm Object to_slice error").await,
+    }
+    TO_UART.send(message_buffer).await;
+
+    /*let mut message = [b' '; 256];
+    message[..text.len()].copy_from_slice(text);
+    TO_UART.send(message).await;*/
+}
+
+static USB_RX: StaticCell<Receiver<'static, Driver<'static, USB_OTG_FS>>> = StaticCell::new();
+static USB_TX: StaticCell<Sender<'static, Driver<'static, USB_OTG_FS>>> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = get_peripherals();
+
+    interrupt::DMA2_STREAM0.set_priority(interrupt::Priority::P0); // adc
+    interrupt::OTG_FS.set_priority(interrupt::Priority::P1); // usb
+    interrupt::OTG_FS_WKUP.set_priority(interrupt::Priority::P3);
+    interrupt::DMA2_STREAM3.set_priority(interrupt::Priority::P2); //spi
 
     let mut onboard_led = Output::new(p.PC13, Level::High, Speed::Low);
 
     let mut pin0 = Output::new(p.PB9, Level::High, Speed::Low);
     let mut pin1 = Output::new(p.PB8, Level::High, Speed::Low);
     let mut pin2 = Output::new(p.PB7, Level::High, Speed::Low);
-    let mut pin3 = Output::new(p.PB6, Level::High, Speed::Low);
 
     onboard_led.set_low();
     pin0.set_low();
     pin1.set_low();
     pin2.set_low();
-    pin3.set_low();
 
     onboard_led.set_high();
 
@@ -164,17 +187,19 @@ async fn main(spawner: Spawner) {
 
     let class = CdcAcmClass::new(&mut builder, state, 64);
     let (usb_tx, usb_rx) = class.split();
+    let usb_tx = USB_TX.init(usb_tx);
+    let usb_rx = USB_RX.init(usb_rx);
 
     // Build the builder.
     let mut usb = builder.build();
 
     pin0.set_high();
 
-    //let _ = spawner.spawn(adc_task(p.ADC1, p.PA2, p.DMA2_CH0));
+    let _ = spawner.spawn(adc_task(p.ADC1, p.PA2, p.DMA2_CH0, p.PB6));
     let _ = spawner.spawn(to_rail(p.SPI1, p.PB3, p.PB5, p.DMA2_CH3));
 
     let _ = spawner.spawn(to_uart(usb_tx));
-    //let _ = spawner.spawn(from_uart(usb_rx));
+    let _ = spawner.spawn(from_uart(usb_rx));
 
     let _ = spawner.spawn(main_loop());
 
@@ -185,20 +210,12 @@ async fn main(spawner: Spawner) {
 
 #[task]
 async fn main_loop() {
-    //spi_message(b"Start main loop").await;
+    spi_message(b"Start main loop\n").await;
 
     loop {
-        yield_now().await;
-        //let command_bytes = TO_MAIN_LOOP.receive().await;
-        let mut command_bytes = [0u8; 256];
-        command_bytes[0] = b'a';
-        command_bytes[1] = b'b';
-        command_bytes[2] = b'x';
-        command_bytes[3] = b'y';
-        //TO_RAIL.send(command_bytes).await;
-        TO_UART.send(command_bytes).await;
-
-        //spi_message(b"Main loop").await;
+        Timer::after_millis(500).await;
+        //spi_message(b"loop\n").await;
+        //usb_message(b"USB\n").await;
 
         /*let result: Result<CommObject, postcard::Error> = postcard::from_bytes(&command_bytes);
         if let Ok(command) = result {
@@ -207,12 +224,18 @@ async fn main_loop() {
                 CommObject::Err(_) => TO_UART.send(command_bytes).await,
             }
         }*/
+
+        let message = TO_MAIN_LOOP.receive().await;
+        TO_UART.send(message).await;
     }
 }
 
 #[task]
-async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
-    //spi_message(b"Start adc_task").await;
+async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0, timing_debug_pin: PB6) {
+    let mut timing_debug_pin = Output::new(timing_debug_pin, Level::High, Speed::Low);
+    timing_debug_pin.set_low();
+
+    spi_message(b"Start adc_task\n").await;
     // sample adc and send to TO_MAIN_LOOP
     let mut adc_sample_store = [0; 512];
 
@@ -236,6 +259,7 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
     // frequently.
     //let mut tic = Instant::now();
     //let mut buffer1 = [0u16; 512]; -> ADC_SAMPLE_STORE
+
     let _ = adc.start();
     loop {
         match adc.read(&mut adc_sample_store).await {
@@ -243,9 +267,16 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
                 //let toc = Instant::now();
                 // process the data
                 //tic = toc;
+                timing_debug_pin.set_high();
+                //spi_message(b"Sampling done\n").await;
+                for _ in 0..25_000 {
+                    cortex_m::asm::nop();
+                }
+                timing_debug_pin.set_low();
             }
             Err(_e) => {
                 //ADC_SAMPLE_STORE = &mut [0u16; 512];
+                spi_message(b"ADC Overrun!!\n").await;
                 adc_sample_store.fill(0u16);
                 let _ = adc.start();
             }
@@ -254,36 +285,33 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0) {
 }
 
 #[task]
-async fn from_uart(mut receiver: Receiver<'static, Driver<'static, USB_OTG_FS>>) {
-    //spi_message(b"Start from_uart").await;
+async fn from_uart(receiver: &'static mut Receiver<'static, Driver<'static, USB_OTG_FS>>) {
+    spi_message(b"Start from_uart\n").await;
 
     // read from usb/uart and write to TO_MAIN_LOOP
     let mut data = [0u8; MAX_PACKET_SIZE];
-    //let mut decoder = encoding::Encoder::new();
+    let mut buffer_index = 0;
+
     loop {
-        //yield_now().await;
-        if let Ok(mut size) = receiver.read_packet(&mut data).await {
-            //loop {
-            /*yield_now().await;
-            let (consumed, success) = decoder.encoded_input(&data, size);
-            if success {
-                let mut buffer: CommBytes = [0u8; MAX_PACKET_SIZE];
-                let message_bytes = decoder.decode();
-                buffer.clone_from_slice(message_bytes);
-                TO_MAIN_LOOP.send(buffer).await;
+        match receiver.read_packet(&mut data[buffer_index..]).await {
+            Ok(size) if size <= MAX_PACKET_SIZE => {
+                spi_message(b"USB received:\n").await;
+                //spi_message(&data[buffer_index..buffer_index + size]).await;
+                buffer_index += size;
+                if buffer_index == MAX_PACKET_SIZE {
+                    TO_MAIN_LOOP.send(data).await;
+                    buffer_index = 0;
+                }
             }
-            size -= consumed;
-            if consumed == 0 {
-                break;
-            }*/
-            //}
-
-            //let _ = TO_MAIN_LOOP.send(data);
-        } else {
-            //spi_message(b"uart receiver error").await;
+            Ok(_) => spi_message(b"Large packet\n").await,
+            Err(EndpointError::BufferOverflow) => {
+                spi_message(b"USB receive: buffer overflow\n").await
+            }
+            Err(EndpointError::Disabled) => {
+                Timer::after_millis(100).await;
+                spi_message(b"USB receive: disabled\n").await
+            }
         }
-
-        // parse_data
     }
 }
 
@@ -296,46 +324,44 @@ async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
 
     let mut spi = Spi::new_txonly(peri, sck, mosi, tx_dma, spi_config);
 
-    spi.write(b"SPI Start\n").await;
-
     loop {
-        let mut to_send = TO_RAIL.receive().await;
-        to_send[32] = b'\n';
-        //let to_send = [0x38u8, 0xB2u8, 0xC8u8, 0x3Fu8];
-        let _ = spi.write(&to_send[0..33]).await;
+        let to_send = TO_RAIL.receive().await;
+        let _ = spi.write(&to_send[0..32]).await;
     }
 }
 
 #[task]
-async fn to_uart(mut sender: Sender<'static, Driver<'static, USB_OTG_FS>>) {
-    //spi_message(b"Start to_uart").await;
+async fn to_uart(sender: &'static mut Sender<'static, Driver<'static, USB_OTG_FS>>) {
+    spi_message(b"Start to_uart\n").await;
 
     // read from TO_UART and write to usb/uart
     loop {
         let message = TO_UART.receive().await;
+        spi_message(b"USB Message out:\n").await;
+        //TO_RAIL.send(message).await; // raw way to so spi_message
 
-        // serialize(message, data)
+        if sender.dtr() {
+            for i in 0..4 {
+                let result = sender.write_packet(&message[64 * i..64 * (i + 1)]).await; // 64 byte packet size
 
-        let mut debug_message = [b' '; 256];
-        debug_message[0..7].copy_from_slice(b"Message");
-        debug_message[8..12].copy_from_slice(&message[0..4]);
-
-        //let _ = sender.write_packet("Test uart\n\r".as_bytes()).await;
-        let result = sender.write_packet(&message[0..4]).await;
-
-        debug_message[12..18].copy_from_slice(b"Result");
-
-        if let Err(e) = result {
-            match e {
-                EndpointError::BufferOverflow => {
-                    debug_message[18..32].copy_from_slice(b"BufferOverflow")
+                if let Err(e) = result {
+                    match e {
+                        EndpointError::BufferOverflow => {
+                            spi_message(b"USB buffer Overflow\n").await
+                        }
+                        EndpointError::Disabled => {
+                            spi_message(b"USB Disabled\n").await;
+                            Timer::after_millis(100).await;
+                        }
+                    }
+                } else {
+                    spi_message(b"USB Ok\n").await;
                 }
-                EndpointError::Disabled => debug_message[18..26].copy_from_slice(b"Disabled"),
             }
+            // flush
+            let _ = sender.write_packet(&[]).await;
         } else {
-            debug_message[18..20].copy_from_slice(b"Ok");
+            spi_message(b"USB not dtr\n").await;
         }
-
-        TO_RAIL.send(debug_message).await;
     }
 }
