@@ -60,8 +60,8 @@ bind_interrupts!(struct Irqs {
 });
 
 static TO_MAIN_LOOP: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
-static TO_UART: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
-static TO_RAIL: Channel<CriticalSectionRawMutex, CommBytes, 2> = Channel::new();
+static TO_UART: Channel<CriticalSectionRawMutex, CommBytes, 4> = Channel::new();
+static TO_RAIL: Channel<CriticalSectionRawMutex, CommBytes, 4> = Channel::new();
 
 fn get_peripherals() -> Peripherals {
     let mut config = Config::default();
@@ -103,7 +103,7 @@ async fn spi_message(text: &[u8]) {
 async fn usb_message(text: &[u8]) {
     let mut message_buffer = [b' '; 256];
 
-    let message_object = CommObject::Text("USB_mesage_test\r\n");
+    let message_object = CommObject::Text("USB_mesage_test\r\n".into());
     match postcard::to_slice(&message_object, &mut message_buffer) {
         Ok(_) => {
             spi_message(b"Usb message Serialized").await;
@@ -213,8 +213,8 @@ async fn main_loop() {
     spi_message(b"Start main loop\n").await;
 
     loop {
-        Timer::after_millis(500).await;
-        //spi_message(b"loop\n").await;
+        Timer::after_millis(100).await;
+        spi_message(b"loop\n").await;
         //usb_message(b"USB\n").await;
 
         /*let result: Result<CommObject, postcard::Error> = postcard::from_bytes(&command_bytes);
@@ -248,7 +248,17 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0, timing_debug_pin: 
     let mut adc: RingBufferedAdc<embassy_stm32::peripherals::ADC1> =
         adc.into_ring_buffered(dma_ch, adc_data);
 
-    adc.set_sample_sequence(Sequence::One, &mut pa2, SampleTime::CYCLES112);
+    /* AI Values test/verify before use
+    SampleTime Value, Sampling Cycles, Total Conversion Cycles (Tconv​=Cycles+12) ,Resulting Sample Rate (fADC​=21 MHz)
+    CYCLES7,          7.5 cycles,      19.5 cycles,                              "1,076,923 SPS"
+    CYCLES13,         13.5 cycles,     25.5 cycles,                              "823,529 SPS"
+    CYCLES28,         28.5 cycles,     40.5 cycles,                              "518,518 SPS"
+    CYCLES56,         56.5 cycles,     68.5 cycles,                              "306,569 SPS"
+    CYCLES84,         84.5 cycles,     96.5 cycles,                              "217,616 SPS"
+    CYCLES112,        112.5 cycles,    124.5 cycles,                             "168,674 SPS"
+     */
+
+    adc.set_sample_sequence(Sequence::One, &mut pa2, SampleTime::CYCLES56); // SampleTime::CYCLES112
 
     // Note that overrun is a big consideration in this implementation. Whatever task is running the adc.read() calls absolutely must circle back around
     // to the adc.read() call before the DMA buffer is wrapped around > 1 time. At this point, the overrun is so significant that the context of
@@ -260,6 +270,8 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0, timing_debug_pin: 
     //let mut tic = Instant::now();
     //let mut buffer1 = [0u16; 512]; -> ADC_SAMPLE_STORE
 
+    let mut n = 0;
+
     let _ = adc.start();
     loop {
         match adc.read(&mut adc_sample_store).await {
@@ -269,8 +281,36 @@ async fn adc_task(adc1: ADC1, mut pa2: PA2, dma_ch: DMA2_CH0, timing_debug_pin: 
                 //tic = toc;
                 timing_debug_pin.set_high();
                 //spi_message(b"Sampling done\n").await;
-                for _ in 0..25_000 {
-                    cortex_m::asm::nop();
+                //for _ in 0..25_000 {
+                //    cortex_m::asm::nop();
+                //}
+                n += 1;
+                if n == 1000 {
+                    n = 0;
+                    let message = CommObject::Samples(
+                        heapless::Vec::from_slice(&adc_sample_store[..64]).unwrap(),
+                    );
+                    let mut message_buffer = [0u8; 256];
+                    let _ = postcard::to_slice(&message, &mut message_buffer);
+                    TO_UART.send(message_buffer).await;
+
+                    let message = CommObject::Samples(
+                        heapless::Vec::from_slice(&adc_sample_store[64..64 * 2]).unwrap(),
+                    );
+                    let _ = postcard::to_slice(&message, &mut message_buffer);
+                    TO_UART.send(message_buffer).await;
+
+                    let message = CommObject::Samples(
+                        heapless::Vec::from_slice(&adc_sample_store[64 * 2..64 * 3]).unwrap(),
+                    );
+                    let _ = postcard::to_slice(&message, &mut message_buffer);
+                    TO_UART.send(message_buffer).await;
+
+                    let message = CommObject::Samples(
+                        heapless::Vec::from_slice(&adc_sample_store[64 * 3..64 * 4]).unwrap(),
+                    );
+                    let _ = postcard::to_slice(&message, &mut message_buffer);
+                    TO_UART.send(message_buffer).await;
                 }
                 timing_debug_pin.set_low();
             }
@@ -320,7 +360,7 @@ async fn to_rail(peri: SPI1, sck: PB3, mosi: PB5, tx_dma: DMA2_CH3) {
     // read from TO_RAIL and write to spi/rails
 
     let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz(1_000_000);
+    spi_config.frequency = Hertz(56_000);
 
     let mut spi = Spi::new_txonly(peri, sck, mosi, tx_dma, spi_config);
 

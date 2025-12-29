@@ -1,12 +1,30 @@
-use std::{error::Error, ffi::CStr};
+mod gui;
+
+use std::{env, error::Error, ffi::CStr};
 
 use interfaces::CommObject;
 use serial2_tokio::SerialPort;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    runtime::Runtime,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    println!("Hello, world!");
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.contains(&String::from("--no-gui")) {
+        let rt = Runtime::new()?;
+        rt.block_on(async { commandline_main().await })?;
+    } else {
+        println!("Gui Init");
+        gui::run()?;
+    }
+
+    Ok(())
+}
+
+//#[tokio::main]
+async fn commandline_main() -> Result<(), Box<dyn Error>> {
+    println!("Init");
 
     let ports = SerialPort::available_ports()?;
 
@@ -18,10 +36,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         panic!("Can't not pick serial port");
     }
 
-    let port = SerialPort::open(&ports[0], 9600)?;
+    let port = SerialPort::open(&ports[0], 921600)?;
     port.set_dtr(true)?;
 
-    let (mut receiver, mut sender) = tokio::io::split(port);
+    let (receiver, sender) = tokio::io::split(port);
 
     let _ = tokio::join!(serial_reader(receiver), serial_writer(sender));
 
@@ -29,6 +47,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn serial_reader(mut receiver: ReadHalf<SerialPort>) -> Result<(), Box<dyn Error>> {
+    println!("Reader started");
+
+    let mut adc_values = [0u16; 4 * 64];
+    let mut adc_value_index = 0;
+
     loop {
         let mut count = 0;
 
@@ -37,9 +60,19 @@ async fn serial_reader(mut receiver: ReadHalf<SerialPort>) -> Result<(), Box<dyn
             let bytes = receiver.read(&mut buffer[count..]).await?;
             count += bytes;
         }
-        let test: Result<CommObject, postcard::Error> = postcard::from_bytes(&buffer);
+        let result: Result<CommObject, postcard::Error> = postcard::from_bytes(&buffer);
+
+        if let Ok(CommObject::Samples(values)) = &result {
+            adc_values[adc_value_index..adc_value_index + values.len()].copy_from_slice(&values);
+            adc_value_index += values.len();
+            if adc_values.len() == adc_value_index {
+                println!("Buffer full: {adc_values:?}");
+                adc_value_index = 0;
+            }
+        }
+
         println!(
-            "{}: {test:?}",
+            "{}: {result:?}",
             chrono::Local::now().format("[%H:%M.%S%.6f] ")
         );
     }
@@ -52,9 +85,8 @@ async fn serial_writer(mut writer: WriteHalf<SerialPort>) -> Result<(), Box<dyn 
         let result_size = tokio::io::stdin().read(&mut input_buffer).await?;
         let cstr = CStr::from_bytes_until_nul(&input_buffer[..result_size + 1])?;
         let str = cstr.to_str()?;
-        println!("Got string: '{str}'");
 
-        let message = CommObject::Text(str);
+        let message = CommObject::Text(str.into());
         let mut message_buffer = [0u8; 256];
         match postcard::to_slice(&message, &mut message_buffer) {
             Ok(_) => match writer.write_all(&message_buffer).await {

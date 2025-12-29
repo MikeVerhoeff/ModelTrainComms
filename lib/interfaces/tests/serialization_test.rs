@@ -3,7 +3,7 @@ use interfaces::encoding;
 
 #[test]
 fn it_works() {
-    let object = CommObject::Text("Hallo, world");
+    let object = CommObject::Text("Hallo, world".into());
     let mut buf = [0u8; 256];
     match postcard::to_slice(&object, &mut buf) {
         Ok(buf) => {
