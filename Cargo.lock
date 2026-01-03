@@ -1705,6 +1705,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
 
 [[package]]
+name = "glam"
+version = "0.30.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd47b05dddf0005d850e5644cae7f2b14ac3df487979dbfff3b56f20b1a6ae46"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,7 +1952,7 @@ checksum = "91ab1937d699403e7e69252ae743a902bcee9f4ab2052cc4c9a46fcf34729d85"
 dependencies = [
  "bitflags 2.9.1",
  "bytes",
- "glam",
+ "glam 0.25.0",
  "lilt",
  "log",
  "num-traits",
@@ -1999,6 +2005,17 @@ dependencies = [
  "rustc-hash 2.1.1",
  "thiserror 2.0.12",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "iced_plot"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4960ef7d707f72cf262489b9f8ba593014022e57cdbe8dc31ea22ee245431022"
+dependencies = [
+ "bytemuck",
+ "glam 0.30.9",
+ "iced",
 ]
 
 [[package]]
@@ -2064,7 +2081,7 @@ dependencies = [
  "bytemuck",
  "cryoglyph",
  "futures",
- "glam",
+ "glam 0.25.0",
  "guillotiere",
  "iced_debug",
  "iced_graphics",
@@ -3003,6 +3020,7 @@ dependencies = [
  "chrono",
  "egui",
  "iced",
+ "iced_plot",
  "interfaces",
  "logic",
  "postcard",

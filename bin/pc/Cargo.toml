@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 egui = "0.32.0"
 iced = { version = "0.14", features = ["tokio"] }
+iced_plot = "0.1"
 interfaces.workspace = true
 logic.workspace = true
 serial2-tokio = "0.1.15"

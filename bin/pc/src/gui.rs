@@ -5,6 +5,7 @@ use tokio::sync::mpsc::Sender;
 use iced::futures::SinkExt;
 use iced::widget::{Column, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Renderer, Subscription, Task, Theme, stream};
+use iced_plot::{Color, LineStyle, MarkerStyle, PlotWidget, PlotWidgetBuilder, Series};
 use interfaces::{CommObject, MAX_PACKET_SIZE};
 use serial2_tokio::SerialPort;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,13 +21,36 @@ pub enum Message {
     PortMessageReceived(PathBuf, CommObject),
     PortMessageSend(PathBuf, CommObject),
     NoOp,
+    PlotMessage(iced_plot::PlotUiMessage),
+}
+
+pub struct AppConnection {
+    tx: Option<Sender<CommObject>>,
+    plot: PlotWidget,
+    messages: Vec<String>,
+}
+
+impl Default for AppConnection {
+    fn default() -> Self {
+        Self {
+            tx: None,
+            plot: PlotWidgetBuilder::new()
+                .with_autoscale_on_updates(true)
+                .with_y_lim(0.0, 4096.0)
+                .with_y_label("Value")
+                .with_y_tick_labels(true)
+                .build()
+                .expect("Plot build failed"),
+            messages: vec![],
+        }
+    }
 }
 
 pub struct App {
     display_text: String,
     is_loading: bool,
     comm_ports: Vec<PathBuf>,
-    connections: HashMap<PathBuf, Option<Sender<CommObject>>>,
+    connections: HashMap<PathBuf, AppConnection>,
 }
 
 impl App {
@@ -61,7 +85,7 @@ impl App {
             }
             Message::ConnectRequest(path_buf) => {
                 if !self.connections.contains_key(&path_buf) {
-                    self.connections.insert(path_buf, None);
+                    self.connections.insert(path_buf, AppConnection::default());
                 };
                 Task::none()
             }
@@ -72,34 +96,50 @@ impl App {
                 Task::none()
             }
             Message::SenderReady(path_buf, tx) => {
-                println!("Send chanel received");
                 if let hash_map::Entry::Occupied(mut entry) = self.connections.entry(path_buf) {
-                    entry.insert(Some(tx));
-                    println!("Send chanel stored");
+                    entry.get_mut().tx = Some(tx);
                 }
                 Task::none()
             }
             Message::PortMessageReceived(path_buf, comm_object) => {
                 println!("{path_buf:?}: {comm_object:?}");
+                if let Some(connection) = self.connections.get_mut(&path_buf) {
+                    match comm_object {
+                        CommObject::Text(m) => connection.messages.push(format!("Text: {m}")),
+                        CommObject::Err(m) => connection.messages.push(format!("Error: {m}")),
+                        CommObject::Samples(items) => {
+                            connection.plot.remove_series("samples");
+                            let data: Vec<[f64; 2]> = items
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &val)| [i as f64, val as f64])
+                                .collect();
+                            let series = Series::line_only(data, LineStyle::Solid)
+                                .with_marker_style(MarkerStyle::circle(4.0))
+                                .with_color(Color::from_rgb(0.8, 0.2, 0.2))
+                                .with_label("samples");
+                            connection.plot.add_series(series).unwrap();
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::PortMessageSend(path_buf, comm_object) => {
-                println!("PortMessageSend start {:?}", self.connections);
-                if let Some(Some(tx)) = self.connections.get(&path_buf) {
-                    println!("PortMessageSend has tx");
-                    let tx = tx.clone();
-                    return Task::perform(
-                        async move {
-                            println!("PortMessageSend task");
-                            let _ = tx.send(comm_object).await;
-                        },
-                        |_| Message::NoOp,
-                    );
+                if let Some(connection) = self.connections.get(&path_buf) {
+                    if let Some(tx) = &connection.tx {
+                        let tx = tx.clone();
+                        return Task::perform(
+                            async move {
+                                let _ = tx.send(comm_object).await;
+                            },
+                            |_| Message::NoOp,
+                        );
+                    }
                 }
-                println!("PortMessageSend end");
                 Task::none()
             }
             Message::NoOp => Task::none(),
+            Message::PlotMessage(_plot_ui_message) => Task::none(),
         }
     }
 
@@ -144,15 +184,21 @@ impl App {
             .align_x(Alignment::Center)
         ];
 
-        for (port, _connection) in &self.connections {
-            content = content.push(column![
-                text(port.to_str().unwrap_or("Unknown")),
-                button("Send test").on_press(Message::PortMessageSend(
-                    port.clone(),
-                    CommObject::Text("test".into())
-                )),
-                text("Latest message: ''")
-            ]);
+        for (port, connection) in &self.connections {
+            let plot_view = connection.plot.view().map(Message::PlotMessage);
+
+            content = content.push(
+                column![
+                    text(port.to_str().unwrap_or("Unknown")),
+                    button("Send test").on_press(Message::PortMessageSend(
+                        port.clone(),
+                        CommObject::Text("test".into())
+                    )),
+                    text(format!("messages:\n{}", connection.messages.join("\n"))),
+                    plot_view
+                ]
+                .padding(40),
+            );
         }
 
         // Center the entire column in the window
